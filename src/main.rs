@@ -1,8 +1,6 @@
-use std::{
-    io::{prelude::*, BufReader},
-    net::{TcpListener, TcpStream},
-};
-
+use native_tls::Identity;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpListener;
 use url::Url;
 
 enum Status {
@@ -39,38 +37,6 @@ impl ResponseHeader {
     }
 }
 
-fn main() -> std::io::Result<()> {
-    let host = "127.0.0.1";
-    let port = "1965";
-    let listener = TcpListener::bind(format!("{host}:{port}"))?;
-
-    println!("Server listening on {host}:{port}");
-
-    // accept incoming connections and process them serially
-    for stream in listener.incoming() {
-        handle_connection(stream.unwrap());
-    }
-
-    Ok(())
-}
-
-fn handle_connection(mut stream: TcpStream) {
-    let buf_reader = BufReader::new(&mut stream);
-    if let Some(Ok(request_line)) = buf_reader.lines().next() {
-        println!("Request: {:#?}", request_line);
-        let response_header = check_request(&request_line);
-
-        let mut response = response_header.render();
-        let default_body = "#Welcome to gemini\nA server by Sal.";
-
-        if let Status::Success = response_header.status {
-            response.push_str(default_body);
-        }
-
-        stream.write_all(response.as_bytes()).unwrap();
-    };
-}
-
 fn check_request(request_line: &String) -> ResponseHeader {
     if request_line.starts_with('﻿') {
         return ResponseHeader::new(
@@ -97,11 +63,60 @@ fn check_request(request_line: &String) -> ResponseHeader {
         return ResponseHeader::new(Status::PermanentFailure, "Not a gemini request.");
     }
 
-    ResponseHeader::new(Status::Success, "Ok")
+    ResponseHeader::new(Status::Success, "text/gemini")
 }
 
-// TODO:
-// Response body function
-// close connection??
-// TLS moeilijkste denk ik.
-// Of misschien multithreading? Tokio?
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Bind the server's socket
+    let addr = "0.0.0.0:1965".to_string();
+    let tcp: TcpListener = TcpListener::bind(&addr).await?;
+
+    let cert = Identity::from_pkcs8(
+        include_bytes!("../keys/gemini.svw.li.crt"),
+        include_bytes!("../keys/gemini.svw.li.key"),
+    )?;
+    let tls_acceptor =
+        tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::builder(cert).build()?);
+
+    loop {
+        // Asynchronously wait for an inbound socket.
+        let (socket, remote_addr) = tcp.accept().await?;
+        let tls_acceptor = tls_acceptor.clone();
+        println!("accept connection from {}", remote_addr);
+        tokio::spawn(async move {
+            // Accept the TLS connection.
+            let mut tls_stream = tls_acceptor.accept(socket).await.expect("accept error");
+
+            let buf_reader = BufReader::new(&mut tls_stream);
+            let mut lines = buf_reader.lines();
+            let first_line = lines
+                .next_line()
+                .await
+                .expect("Error reading first line of stream.");
+
+            if let Some(request_line) = first_line {
+                let response_header = check_request(&request_line);
+                let default_body = "#Sal's Gemini server\nWelcome to the Sal gemini server. There is still a lot to implement.\r\n";
+
+                let mut response = response_header.render();
+
+                match response_header.status {
+                    Status::Success => {
+                        println!("Request: [{}] {}", Status::Success.code(), &request_line);
+                        response.push_str(default_body);
+                    }
+                    Status::BadRequest => println!("BadRequest: {}", &request_line),
+                    _ => println!("Not able to process request: {}", &request_line),
+                }
+
+                tls_stream.write_all(response.as_bytes()).await.unwrap();
+            }
+
+            tls_stream
+                .shutdown()
+                .await
+                .expect("failed to shut down stream");
+        });
+    }
+}

@@ -2,7 +2,7 @@ use native_tls::Identity;
 use std::fs;
 use std::path::PathBuf;
 use std::result::Result;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_native_tls::TlsStream;
 use url::Url;
@@ -11,6 +11,7 @@ enum Status {
     Success,
     TemporaryFailure,
     PermanentFailure,
+    ProxyRequestRefused,
     NotFound,
     BadRequest,
 }
@@ -21,6 +22,7 @@ impl Status {
             Status::Success => 20,
             Status::TemporaryFailure => 40,
             Status::PermanentFailure => 50,
+            Status::ProxyRequestRefused => 53,
             Status::NotFound => 51,
             Status::BadRequest => 59,
         }
@@ -64,27 +66,34 @@ impl Response {
     }
 }
 
-fn parse_request(request_line: &String) -> Result<url::Url, &'static str> {
+fn parse_request(request_line: String) -> Result<url::Url, &'static str> {
     if request_line.starts_with('﻿') {
         Err("The request MUST NOT begin with a U+FEFF byte order mark.")
     } else if request_line.len() > 1024 {
         Err("URL is too long. Maximum length is 1024 bytes.")
     } else {
-        match Url::parse(request_line) {
+        match Url::parse(&request_line) {
             Ok(u) => Ok(u),
             Err(_) => Err("Error parsing the url"),
         }
     }
 }
 
-fn process_request(request: &String) -> Response {
-    let default_body = "# Shooting Star\nThe shooting star server is up and running but there is nothing hosted here".to_string();
+fn process_request(request: String) -> Response {
+    // TODO: Default index.gmi in repo? "# Shooting Star\nThe shooting star server is up and running but there is nothing hosted here".to_string();
 
+    // TODO: allowed hosts config
     match parse_request(request) {
         Ok(url) => {
-            if url.scheme() != "gemini" || url.cannot_be_a_base() {
+            if url.scheme() != "gemini"
+                || url.cannot_be_a_base()
+                || url.port().is_some_and(|p| p != 1965)
+            {
                 return Response {
-                    header: ResponseHeader::new(Status::PermanentFailure, "Not a gemini request."),
+                    header: ResponseHeader::new(
+                        Status::ProxyRequestRefused,
+                        "Not a gemini request.",
+                    ),
                     body: None,
                 };
             }
@@ -94,11 +103,19 @@ fn process_request(request: &String) -> Response {
             let mut read_path = PathBuf::from(root_dir);
 
             let mut path = url.path();
-            if path == "/" {
+
+            println!("{path}");
+            if path == "/" || path.is_empty() {
                 path = "/index.gmi";
             }
 
             read_path.push(path.trim_start_matches('/'));
+
+            println!(
+                "{path} Read Path: {:?} {}",
+                read_path,
+                path.trim_start_matches('/')
+            );
 
             if !read_path.exists() {
                 return Response {
@@ -126,16 +143,27 @@ fn process_request(request: &String) -> Response {
     }
 }
 
-async fn process_tls_stream(mut stream: &mut TlsStream<TcpStream>) {
-    let buf_reader = BufReader::new(&mut stream);
-    let mut lines = buf_reader.lines();
-    let first_line = lines
-        .next_line()
+async fn process_tls_stream(stream: &mut TlsStream<TcpStream>) {
+    let mut buffer = [0; 1026]; // 1024 for the url + CRLF
+    let n = stream
+        .read(&mut buffer)
         .await
         .expect("Error reading first line of stream.");
 
-    if let Some(request_line) = first_line {
-        let response = process_request(&request_line);
+    if n == 0 {
+        return;
+    }
+
+    if let Ok(raw_line) = String::from_utf8(buffer[0..n].into()) {
+        let request_line = match raw_line.split_once("\r\n") {
+            Some((l, _)) => l,
+            None => {
+                println!("ja");
+                return;
+            }
+        };
+
+        let response = process_request(request_line.to_string());
 
         match response.header.status {
             Status::Success => {

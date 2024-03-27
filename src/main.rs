@@ -1,8 +1,9 @@
+use clap::{arg, Parser};
 use native_tls::Identity;
 use std::fs;
 use std::path::PathBuf;
 use std::result::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_native_tls::TlsStream;
 use url::Url;
@@ -10,7 +11,7 @@ use url::Url;
 enum Status {
     Success,
     TemporaryFailure,
-    PermanentFailure,
+    // PermanentFailure,
     ProxyRequestRefused,
     NotFound,
     BadRequest,
@@ -21,7 +22,7 @@ impl Status {
         match self {
             Status::Success => 20,
             Status::TemporaryFailure => 40,
-            Status::PermanentFailure => 50,
+            // Status::PermanentFailure => 50,
             Status::ProxyRequestRefused => 53,
             Status::NotFound => 51,
             Status::BadRequest => 59,
@@ -79,15 +80,14 @@ fn parse_request(request_line: String) -> Result<url::Url, &'static str> {
     }
 }
 
-fn process_request(request: String) -> Response {
-    // TODO: Default index.gmi in repo? "# Shooting Star\nThe shooting star server is up and running but there is nothing hosted here".to_string();
+fn process_request(request: String, config: &Config) -> Response {
+    // NOTE: Default index.gmi in repo? "# Shooting Star\nThe shooting star server is up and running but there is nothing hosted here".to_string();
 
-    // TODO: allowed hosts config
     match parse_request(request) {
         Ok(url) => {
             if url.scheme() != "gemini"
                 || url.cannot_be_a_base()
-                || url.port().is_some_and(|p| p != 1965)
+                || url.port().is_some_and(|p| p != config.port)
             {
                 return Response {
                     header: ResponseHeader::new(
@@ -98,24 +98,27 @@ fn process_request(request: String) -> Response {
                 };
             }
 
-            let root_dir = "./documents";
+            if url
+                .host_str()
+                .is_some_and(|h| !config.allowed_hosts.contains(&h.to_string()))
+            {
+                return Response {
+                    header: ResponseHeader::new(
+                        Status::ProxyRequestRefused,
+                        "This host is not served here.",
+                    ),
+                    body: None,
+                };
+            }
 
-            let mut read_path = PathBuf::from(root_dir);
-
+            let mut read_path = PathBuf::from(&config.root);
             let mut path = url.path();
 
-            println!("{path}");
             if path == "/" || path.is_empty() {
                 path = "/index.gmi";
             }
 
             read_path.push(path.trim_start_matches('/'));
-
-            println!(
-                "{path} Read Path: {:?} {}",
-                read_path,
-                path.trim_start_matches('/')
-            );
 
             if !read_path.exists() {
                 return Response {
@@ -143,7 +146,7 @@ fn process_request(request: String) -> Response {
     }
 }
 
-async fn process_tls_stream(stream: &mut TlsStream<TcpStream>) {
+async fn process_tls_stream(stream: &mut TlsStream<TcpStream>, config: &Config) {
     let mut buffer = [0; 1026]; // 1024 for the url + CRLF
     let n = stream
         .read(&mut buffer)
@@ -158,12 +161,11 @@ async fn process_tls_stream(stream: &mut TlsStream<TcpStream>) {
         let request_line = match raw_line.split_once("\r\n") {
             Some((l, _)) => l,
             None => {
-                println!("ja");
                 return;
             }
         };
 
-        let response = process_request(request_line.to_string());
+        let response = process_request(request_line.to_string(), config);
 
         match response.header.status {
             Status::Success => {
@@ -181,28 +183,81 @@ async fn process_tls_stream(stream: &mut TlsStream<TcpStream>) {
     }
 }
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Host name. The default is 0.0.0.0.
+    #[arg(short = 'H', long)]
+    host: Option<String>,
+
+    /// Port. The default is 1965.
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Certificate
+    #[arg(short, long)]
+    cert: PathBuf,
+
+    /// Private Key
+    #[arg(short, long)]
+    key: PathBuf,
+
+    /// Document root
+    #[arg(short, long)]
+    root: PathBuf,
+
+    /// List of additional allowed hostnames
+    #[arg(short, long)]
+    allowed_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Config {
+    host: String,
+    port: u16,
+    cert: PathBuf,
+    key: PathBuf,
+    root: PathBuf,
+    allowed_hosts: Vec<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "0.0.0.0:1965".to_string();
+    let args = Args::parse();
+
+    let host = args.host.unwrap_or("0.0.0.0".to_string());
+    let config = Config {
+        host: host.clone(),
+        port: args.port.unwrap_or(1965),
+        cert: args.cert,
+        key: args.key,
+        root: args.root,
+        allowed_hosts: {
+            let mut allowed_hosts = args.allowed_hosts;
+            allowed_hosts.push(host);
+            allowed_hosts
+        },
+    };
+
+    let addr = format!("{}:{}", config.host, config.port);
     let tcp: TcpListener = TcpListener::bind(&addr).await?;
 
-    let cert = Identity::from_pkcs8(
-        // TODO: Certificate is included at compile time for now but I want tot use arguments in the future.
-        include_bytes!("../keys/gemini.svw.li.crt"),
-        include_bytes!("../keys/gemini.svw.li.key"),
-    )?;
+    let cert_file = fs::read(&config.cert).expect("Error reading Certificate.");
+    let key_file = fs::read(&config.key).expect("Error reading Key");
+    let cert = Identity::from_pkcs8(&cert_file, &key_file)?;
     let tls_acceptor =
         tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::builder(cert).build()?);
 
     loop {
         let (socket, remote_addr) = tcp.accept().await.expect("error accepting tcp connection");
         let tls_acceptor = tls_acceptor.clone();
+        let config = config.clone();
         println!("accept connection from {}", remote_addr);
         tokio::spawn(async move {
             // Accept the TLS connection.
             match tls_acceptor.accept(socket).await {
                 Ok(mut stream) => {
-                    process_tls_stream(&mut stream).await;
+                    process_tls_stream(&mut stream, &config).await;
                     stream.shutdown().await.expect("failed to shut down stream");
                 }
 

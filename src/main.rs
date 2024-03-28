@@ -50,20 +50,17 @@ impl ResponseHeader {
 
 struct Response {
     header: ResponseHeader,
-    body: Option<String>,
+    body: Option<Vec<u8>>,
 }
 impl Response {
-    fn render(&self) -> String {
-        match self.header.status {
-            Status::Success => {
-                self.header.render()
-                    + match &self.body {
-                        Some(s) => s,
-                        None => "",
-                    }
-            }
-            _ => self.header.render(),
+    fn render(&self) -> Vec<u8> {
+        let mut response = self.header.render().into_bytes();
+
+        if let (Some(body), Status::Success) = (&self.body, &self.header.status) {
+            response.extend_from_slice(&body);
         }
+
+        response
     }
 }
 
@@ -127,7 +124,7 @@ fn process_request(request: String, config: &Config) -> Response {
                 };
             }
 
-            if let Ok(body) = fs::read_to_string(read_path) {
+            if let Ok(body) = fs::read(read_path) {
                 Response {
                     header: ResponseHeader::new(Status::Success, "text/gemini"),
                     body: Some(body),
@@ -176,10 +173,7 @@ async fn process_tls_stream(stream: &mut TlsStream<TcpStream>, config: &Config) 
             _ => println!("Not able to process request: {request_line}"),
         }
 
-        stream
-            .write_all(response.render().as_bytes())
-            .await
-            .unwrap();
+        stream.write_all(&response.render()).await.unwrap();
     }
 }
 

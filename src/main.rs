@@ -1,3 +1,4 @@
+use chrono::Local;
 use clap::{arg, Parser};
 use native_tls::Identity;
 use std::fs;
@@ -109,13 +110,12 @@ fn process_request(request: String, config: &Config) -> Response {
             }
 
             let mut read_path = PathBuf::from(&config.root);
-            let mut path = url.path();
 
-            if path == "/" || path.is_empty() {
-                path = "/index.gmi";
+            read_path.push(url.path().trim_start_matches('/'));
+
+            if read_path.is_dir() {
+                read_path.push("index.gmi");
             }
-
-            read_path.push(path.trim_start_matches('/'));
 
             if !read_path.exists() {
                 return Response {
@@ -124,9 +124,13 @@ fn process_request(request: String, config: &Config) -> Response {
                 };
             }
 
+            let mime = mime_guess::from_path(&read_path)
+                .first_or_text_plain()
+                .to_string();
+
             if let Ok(body) = fs::read(read_path) {
                 Response {
-                    header: ResponseHeader::new(Status::Success, "text/gemini"),
+                    header: ResponseHeader::new(Status::Success, &mime),
                     body: Some(body),
                 }
             } else {
@@ -246,7 +250,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (socket, remote_addr) = tcp.accept().await.expect("error accepting tcp connection");
         let tls_acceptor = tls_acceptor.clone();
         let config = config.clone();
-        println!("accept connection from {}", remote_addr);
+        let date_time = Local::now();
+
+        print!(
+            "[{}]: Accept connection from {}, ",
+            date_time.format("%d/%m/%Y %H:%M"),
+            remote_addr
+        );
         tokio::spawn(async move {
             // Accept the TLS connection.
             match tls_acceptor.accept(socket).await {
